@@ -1,0 +1,109 @@
+# ============================================================
+# Shackles Symposium - Local Development Stack
+# ============================================================
+# Services:
+#   db        - PostgreSQL 15 (main database)
+#   valkey    - Valkey 8 (Redis-compatible cache + ARQ queue)
+#   pgadmin   - pgAdmin 4 web UI (manage the DB from browser)
+#   mailhog   - Local SMTP + web UI (catches all outgoing emails)
+# ============================================================
+
+services:
+  # ----------------------------------------------------------
+  # PostgreSQL 15 — main application database
+  # ----------------------------------------------------------
+  db:
+    image: postgres:15-alpine
+    container_name: shackles-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: shackles
+      POSTGRES_PASSWORD: shackles_dev
+      POSTGRES_DB: shackles
+      # Speeds up initdb; safe for local dev
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U shackles -d shackles" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ----------------------------------------------------------
+  # Valkey 8 — Redis-compatible cache and ARQ queue
+  # ----------------------------------------------------------
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: shackles-valkey
+    restart: unless-stopped
+    command: >
+      valkey-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: [ "CMD", "valkey-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # ----------------------------------------------------------
+  # pgAdmin 4 — Web UI for managing PostgreSQL
+  # Access: http://localhost:5050
+  # Login:  admin@shackles.local / admin
+  # ----------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: shackles-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ----------------------------------------------------------
+  # MailHog — Local SMTP server + web UI for testing emails
+  # SMTP:   localhost:1025
+  # Web UI: http://localhost:8025
+  # ----------------------------------------------------------
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: shackles-mailhog
+    restart: unless-stopped
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # Web UI
+    environment:
+      MH_STORAGE: memory
+
+# ============================================================
+# Named volumes (persist data across container restarts)
+# ============================================================
+volumes:
+  postgres_data:
+    name: shackles_postgres_data
+  valkey_data:
+    name: shackles_valkey_data
+  pgadmin_data:
+    name: shackles_pgadmin_data
+
+# ============================================================
+# Custom network (keeps containers isolated from other projects)
+# ============================================================
+networks:
+  default:
+    name: shackles_network
