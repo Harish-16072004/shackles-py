@@ -1,13 +1,15 @@
-"""TeamService — create, join, lock, and manage teams.
+"""TeamService — create, join, lock, invite, and manage teams.
 
 This service covers the full team lifecycle for TEAM-mode events:
 
   - create_team          — leader creates a team with a join code
   - join_by_code         — member joins using the team's join code
   - join_by_team_code    — member joins using the event-scoped team code
+  - join_by_invite_token — member joins using an emailed invite token
+  - create_invites       — leader creates token-based email invitations
   - lock_team            — leader/admin finalizes the roster
   - change_leader        — admin swaps the team leader
-  - remove_member        — admin removes a member
+  - remove_member        — leader/admin removes a member
   - delete_team          — admin deletes the whole team
   - bulk_register        — on-spot kiosk: register a roster in one call
 
@@ -16,8 +18,8 @@ capacity) via shared helpers. None of them commit — the API layer owns
 the transaction boundary.
 """
 
-import secrets
 from datetime import datetime, timedelta, timezone
+import secrets
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +31,8 @@ from shackles.errors import (
     EVENT_INACTIVE,
     EVENT_NOT_FOUND,
     EVENT_WRONG_YEAR,
+    INVALID_TOKEN,
+    JOIN_CODE_INVALID,
     NO_VERIFIED_PACKAGE,
     NOT_TEAM_EVENT,
     PACKAGE_NOT_ALLOWED,
@@ -40,6 +44,8 @@ from shackles.errors import (
     TEAM_NAME_EXISTS,
     TEAM_NOT_FOUND,
     TIME_CLASH,
+    TOKEN_EXPIRED,
+    UNAUTHORIZED,
     USER_NOT_FOUND,
     DomainError,
 )
@@ -51,8 +57,8 @@ from shackles.models.enums import (
     TeamStatus,
 )
 from shackles.models.event import Event
-from shackles.models.event_registration import EventRegistration
 from shackles.models.team import Team
+from shackles.models.team_invite import TeamInvite
 from shackles.models.user import User
 from shackles.repositories.event_registration_repo import (
     EventRegistrationRepository,
@@ -62,6 +68,7 @@ from shackles.repositories.paper_submission_repo import (
     PaperSubmissionRepository,
 )
 from shackles.repositories.payment_repo import PaymentRepository
+from shackles.repositories.team_invite_repo import TeamInviteRepository
 from shackles.repositories.team_repo import TeamRepository
 from shackles.repositories.user_repo import UserRepository
 from shackles.services.notifications import (
@@ -70,9 +77,11 @@ from shackles.services.notifications import (
     notify_team_created,
     notify_team_locked,
 )
+from shackles.workers.queue import enqueue_email_job
 
 
 _JOIN_CODE_TTL_DAYS = 7
+_INVITE_TTL_DAYS = 7
 _TEAM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no I, O, 0, 1
 _JOIN_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789"
 _TEAM_NAME_BANNED = {
@@ -91,6 +100,7 @@ class TeamService:
         self.payments = PaymentRepository(session)
         self.registrations = EventRegistrationRepository(session)
         self.teams = TeamRepository(session)
+        self.invites = TeamInviteRepository(session)
         self.papers = PaperSubmissionRepository(session)
 
     # ========================================================
@@ -171,7 +181,6 @@ class TeamService:
             year=settings.active_year,
         )
 
-        # Notify (stub)
         await notify_team_created(
             leader_email=leader.email,
             leader_name=f"{leader.first_name} {leader.last_name}".strip(),
@@ -185,7 +194,7 @@ class TeamService:
         return team
 
     # ========================================================
-    # Join team (by join code or team code)
+    # Join team (by join code, team code, or invite token)
     # ========================================================
 
     async def join_by_join_code(
@@ -197,8 +206,16 @@ class TeamService:
         team = await self.teams.get_by_join_code(join_code)
         if team is None:
             raise DomainError(
-                "JOIN_CODE_INVALID",
+                JOIN_CODE_INVALID,
                 "Invalid join code.",
+            )
+        if (
+            team.join_code_expires_at is not None
+            and datetime.now(timezone.utc) > team.join_code_expires_at
+        ):
+            raise DomainError(
+                TOKEN_EXPIRED,
+                "This team join code has expired.",
             )
         return await self._do_join(user_id, team)
 
@@ -217,12 +234,134 @@ class TeamService:
             )
         return await self._do_join(user_id, team)
 
+    async def join_by_invite_token(
+        self,
+        user_id: UUID,
+        event_id: UUID,
+        team_code: str,
+        invite_token: str,
+    ) -> Team:
+        """Join a team using an emailed invitation token."""
+        invite = await self.invites.get_by_token(invite_token)
+        if invite is None:
+            raise DomainError(INVALID_TOKEN, "Invalid team invitation token.")
+        if invite.used_at is not None:
+            raise DomainError(INVALID_TOKEN, "This invitation has already been used.")
+        if datetime.now(timezone.utc) > invite.expires_at:
+            raise DomainError(TOKEN_EXPIRED, "This invitation has expired.")
+
+        team = await self.teams.get(invite.team_id)
+        if team is None or team.event_id != event_id or team.team_code != team_code:
+            raise DomainError(
+                TEAM_NOT_FOUND,
+                "Invitation does not match the specified event and team code.",
+            )
+
+        user = await self.users.get(user_id)
+        if user is None:
+            raise DomainError(USER_NOT_FOUND, "User not found.")
+        if (
+            invite.invited_email
+            and invite.invited_email.lower() != user.email.lower()
+        ):
+            raise DomainError(
+                UNAUTHORIZED,
+                "This invitation was sent to a different email address.",
+            )
+
+        updated_team = await self._do_join(user_id, team)
+        invite.used_at = datetime.now(timezone.utc)
+        invite.used_by_user_id = user_id
+        await self.session.flush()
+        return updated_team
+
+    # ========================================================
+    # Team Invites
+    # ========================================================
+
+    async def create_invites(
+        self,
+        team_id: UUID,
+        requesting_user_id: UUID,
+        emails: list[str],
+    ) -> list[TeamInvite]:
+        """Create token-based invitations for teammates."""
+        team = await self.teams.get(team_id)
+        if team is None:
+            raise DomainError(TEAM_NOT_FOUND, "Team not found.")
+        if team.leader_user_id != requesting_user_id:
+            raise DomainError(
+                UNAUTHORIZED,
+                "Only the team leader can send invitations.",
+            )
+        if team.status != TeamStatus.OPEN.value:
+            raise DomainError(
+                TEAM_LOCKED,
+                "Cannot send invitations for a locked team.",
+            )
+
+        event = await self.events.get(team.event_id)
+        event_name = event.name if event else "Event"
+        created_invites: list[TeamInvite] = []
+        expires_at = datetime.now(timezone.utc) + timedelta(days=_INVITE_TTL_DAYS)
+
+        for raw_email in emails:
+            email_clean = raw_email.strip().lower()
+            if await self.invites.has_active_invite_for_email(team.id, email_clean):
+                continue
+            token = secrets.token_urlsafe(24)
+            invite = await self.invites.create(
+                team_id=team.id,
+                invited_email=email_clean,
+                invited_by_user_id=requesting_user_id,
+                token=token,
+                expires_at=expires_at,
+            )
+            created_invites.append(invite)
+            invite_url = (
+                f"{settings.public_app_url}/events/{team.event_id}/join"
+                f"?team_code={team.team_code}&token={token}"
+            )
+            await enqueue_email_job(
+                template_name="generic",
+                to=email_clean,
+                context={
+                    "subject": f"Team Invitation: {team.name} ({event_name})",
+                    "message": (
+                        f"You have been invited to join team '{team.name}' for "
+                        f"{event_name}. Team Code: {team.team_code}. "
+                        f"Accept your invitation at: {invite_url}"
+                    ),
+                    "year": settings.active_year,
+                },
+            )
+
+        return created_invites
+
+    async def list_invites_for_team(
+        self,
+        team_id: UUID,
+        requesting_user_id: UUID,
+    ) -> list[TeamInvite]:
+        """List active invitations for a team (leader or admin only)."""
+        team = await self.teams.get(team_id)
+        if team is None:
+            raise DomainError(TEAM_NOT_FOUND, "Team not found.")
+        if team.leader_user_id != requesting_user_id:
+            requestor = await self.users.get(requesting_user_id)
+            if requestor is None or requestor.role not in ("ADMIN", "COORDINATOR"):
+                raise DomainError(
+                    UNAUTHORIZED,
+                    "Only the team leader or staff can view invitations.",
+                )
+        return await self.invites.list_active_for_team(team_id)
+
     async def _do_join(
         self,
         user_id: UUID,
         team: Team,
     ) -> Team:
-        """Shared logic for joining a team via either code."""
+        """Shared logic for joining a team via code or invite."""
         if team.status != TeamStatus.OPEN.value:
             raise DomainError(
                 TEAM_LOCKED,
@@ -268,7 +407,6 @@ class TeamService:
         if refreshed is not None and refreshed.member_count >= max_size:
             await self._try_lock_internal(refreshed, locked_by=str(user.id))
 
-        # Notify (stub)
         leader = None
         if team.leader_user_id:
             leader = await self.users.get(team.leader_user_id)
@@ -299,8 +437,6 @@ class TeamService:
         """Lock a team, validating min/max sizes.
 
         Authorization: only the leader or an ADMIN/COORDINATOR can lock.
-        (The API layer may already enforce admin-only, but this allows
-        the leader to finalize their own team.)
         """
         team = await self.teams.get_with_members(team_id)
         if team is None:
@@ -313,7 +449,7 @@ class TeamService:
             requestor = await self.users.get(requesting_user_id)
             if requestor is None or requestor.role not in ("ADMIN", "COORDINATOR"):
                 raise DomainError(
-                    "UNAUTHORIZED",
+                    UNAUTHORIZED,
                     "Only the leader or an admin can lock this team.",
                 )
 
@@ -362,7 +498,7 @@ class TeamService:
                 abstract_deadline=event.submission_deadline,
             )
 
-        # Notify members (stub)
+        # Notify members
         for reg in team.members:
             member = await self.users.get(reg.user_id)
             if member is None:
@@ -400,16 +536,13 @@ class TeamService:
         *,
         locked_by: str,
     ) -> bool:
-        """Internal lock: called after auto-capacity is reached.
-
-        Silently returns False if the team is already locked — no error.
-        """
+        """Internal lock: called after auto-capacity is reached."""
         if team.status != TeamStatus.OPEN.value:
             return False
         return await self.teams.try_lock(team.id, locked_by=locked_by)
 
     # ========================================================
-    # Admin actions
+    # Admin & Leader actions
     # ========================================================
 
     async def change_leader(
@@ -460,12 +593,30 @@ class TeamService:
         self,
         team_id: UUID,
         user_id: UUID,
+        *,
+        requesting_user_id: UUID | None = None,
     ) -> Team | None:
         """Remove a member from a team. Returns the team (or None if
         the team became empty and was deleted)."""
         team = await self.teams.get_with_members(team_id)
         if team is None:
             raise DomainError(TEAM_NOT_FOUND, "Team not found.")
+
+        if requesting_user_id is not None:
+            requestor = await self.users.get(requesting_user_id)
+            is_staff = requestor is not None and requestor.role in ("ADMIN", "COORDINATOR")
+            is_leader = team.leader_user_id == requesting_user_id
+            is_self = user_id == requesting_user_id
+            if not (is_staff or is_leader or is_self):
+                raise DomainError(
+                    UNAUTHORIZED,
+                    "Only the team leader, the member themselves, or an admin can remove a member.",
+                )
+            if not is_staff and team.status == TeamStatus.LOCKED.value:
+                raise DomainError(
+                    TEAM_LOCKED,
+                    "Cannot remove members from a locked team.",
+                )
 
         target = next((r for r in team.members if r.user_id == user_id), None)
         if target is None:
@@ -507,8 +658,6 @@ class TeamService:
         team = await self.teams.get(team_id)
         if team is None:
             raise DomainError(TEAM_NOT_FOUND, "Team not found.")
-        # Cascade deletes registrations via FK ondelete='SET NULL' + explicit
-        # cleanup to avoid orphaned rows:
         members = await self.registrations.list_by_team(team_id)
         for reg in members:
             await self.registrations.delete(reg.id)
@@ -529,17 +678,9 @@ class TeamService:
         mark_attended: bool = False,
         station_id: str | None = None,
     ) -> Team:
-        """On-spot bulk registration from a list of Shackles IDs.
-
-        Used by the scanner's team-registration flow. Every listed
-        Shackles ID must have a verified payment for the active year.
-
-        Raises:
-            DomainError on any validation failure.
-        """
+        """On-spot bulk registration from a list of Shackles IDs."""
         event = await self._load_and_validate_team_event(event_id)
 
-        # Deduplicate + normalize Shackles IDs
         normalized_ids = list(dict.fromkeys(
             sid.strip().upper() for sid in shackles_ids if sid and sid.strip()
         ))
@@ -556,7 +697,6 @@ class TeamService:
                 "Leader Shackles ID must be in the roster.",
             )
 
-        # Resolve all users
         users = await self.users.get_by_shackles_ids(normalized_ids)
         by_shackles = {u.shackles_id: u for u in users if u.shackles_id}
 
@@ -568,7 +708,6 @@ class TeamService:
                 {"missing": missing},
             )
 
-        # Validate every user's payment + package
         for sid in normalized_ids:
             user = by_shackles[sid]
             payment = await self.payments.get_by_user_id(user.id)
@@ -587,13 +726,11 @@ class TeamService:
                     f"Package for {sid} does not allow this event category.",
                 )
 
-        # Team name validation
         normalized_name = _normalize_team_name(team_name)
         name_error = _validate_team_name(team_name, normalized_name)
         if name_error:
             raise DomainError("INVALID_TEAM_NAME", name_error)
 
-        # Find or create the team
         team = await self.teams.get_by_event_and_name(event.id, normalized_name)
         if team is None:
             team_code = await self._generate_unique_team_code(event.id)
@@ -610,7 +747,6 @@ class TeamService:
                 member_count=0,
             )
 
-        # Check no one is already registered
         for sid in normalized_ids:
             user = by_shackles[sid]
             if await self.registrations.is_registered(user.id, event.id):
@@ -627,7 +763,6 @@ class TeamService:
                 f"Team would exceed the max size of {max_size}.",
             )
 
-        # Add each member
         now = datetime.now(timezone.utc)
         for sid in normalized_ids:
             user = by_shackles[sid]
@@ -651,11 +786,9 @@ class TeamService:
                 year=settings.active_year,
             )
 
-        # Update member_count
         new_count = existing_members + len(normalized_ids)
         await self.teams.set_member_count(team.id, new_count)
 
-        # Lock if requested or if team is now full
         if lock or new_count >= max_size:
             min_size = event.team_min_size or 2
             if new_count >= min_size:
@@ -680,8 +813,21 @@ class TeamService:
         return await self.teams.list_by_event(event_id, status=status)
 
     async def list_my_teams(self, user_id: UUID) -> list[Team]:
-        """List teams where this user is the leader."""
-        return await self.teams.list_led_by_user(user_id)
+        """List all teams where this user is a member or leader."""
+        regs = await self.registrations.list_by_user(
+            user_id, year=settings.active_year
+        )
+        team_ids = [reg.team_id for reg in regs if reg.team_id is not None]
+        teams: list[Team] = []
+        seen: set[UUID] = set()
+        for tid in team_ids:
+            if tid in seen:
+                continue
+            seen.add(tid)
+            t = await self.teams.get(tid)
+            if t is not None:
+                teams.append(t)
+        return teams
 
     async def get_team_with_members(self, team_id: UUID) -> Team:
         """Fetch a team with members. Raises if not found."""
@@ -752,7 +898,6 @@ class TeamService:
             )
             if not await self.teams.team_code_exists(event_id, code):
                 return code
-        # Fallback (extremely unlikely)
         return secrets.token_hex(4).upper()
 
     async def _generate_unique_join_code(self) -> str:

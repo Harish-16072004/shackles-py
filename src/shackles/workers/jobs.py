@@ -6,13 +6,12 @@ we create a fresh session per job and dispose it when done.
 """
 
 import logging
-from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
 from uuid import UUID
 
 from shackles.config import settings
 from shackles.db.engine import SessionLocal
+from shackles.repositories.payment_repo import PaymentRepository
 from shackles.repositories.user_repo import UserRepository
 from shackles.services.email import send_email
 from shackles.services.email_templates import render_email_template
@@ -104,10 +103,16 @@ async def generate_qr_job(
     _save_to_storage(key, png_bytes)
     public_url = _public_url_for_key(key)
 
-    # 4. Update DB
+    # 4. Update DB & fetch package_type
+    package_type = "EVENT_ONLY"
     async with SessionLocal() as session:
         repo = UserRepository(session)
-        user = await repo.get(UUID(user_id))
+        payment_repo = PaymentRepository(session)
+        user_uuid = UUID(user_id)
+        user = await repo.get(user_uuid)
+        payment = await payment_repo.get_by_user_id(user_uuid)
+        if payment is not None and payment.package_type:
+            package_type = payment.package_type
         if user is not None:
             user.qr_path = key
             user.qr_image_url = public_url
@@ -132,7 +137,7 @@ async def generate_qr_job(
                     "subject": f"Payment Verified — Shackles {year}",
                     "user_name": user_name,
                     "shackles_id": shackles_id,
-                    "package_type": "Event Access",
+                    "package_type": package_type,
                     "year": year,
                     "qr_image_url": public_url,
                 },

@@ -1,10 +1,11 @@
 """OnSpotProfile schemas."""
 
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import Field
 
-from shackles.schemas.common import ApiBase, ApiRead, ApiWrite
+from shackles.schemas.common import ApiRead, ApiWrite
 
 
 class OnSpotProfileCreate(ApiWrite):
@@ -26,5 +27,5 @@ class OnSpotProfileRead(ApiRead):
     device_id: str | None
     referral_source: str | None
     notes: str | None
-    created_at: str
-    updated_at: str
+    created_at: datetime
+    updated_at: datetime

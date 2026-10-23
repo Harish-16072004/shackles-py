@@ -1,4 +1,4 @@
-"""FastAPI dependencies — auth, session, and role guards.
+"""FastAPI dependencies — auth, session, and role/permission guards.
 
 Every protected route uses one of:
 
@@ -6,12 +6,17 @@ Every protected route uses one of:
     admin: User = Depends(get_current_admin)      # ADMIN only
     staff: User = Depends(get_current_staff)      # ADMIN | COORDINATOR | VOLUNTEER
 
+Fine-grained permissions can also be enforced with:
+
+    user: User = Depends(require_permission(Permission.SCAN_KIT))
+
 And every route that touches the DB uses:
 
     session: AsyncSession = Depends(get_session)
 """
 
-from typing import Annotated
+from collections.abc import Callable, Coroutine
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
@@ -19,9 +24,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shackles.db.session import get_session
-from shackles.errors import DomainError, UNAUTHORIZED
-from shackles.models.enums import Role
+from shackles.models.enums import Permission, Role
 from shackles.models.user import User
+from shackles.repositories.role_permission_repo import RolePermissionRepository
 from shackles.repositories.user_repo import UserRepository
 from shackles.services.tokens import decode_access_token
 
@@ -119,6 +124,31 @@ async def get_current_staff(
             detail="Staff access required",
         )
     return user
+
+
+def require_permission(
+    permission: Permission,
+) -> Callable[..., Coroutine[Any, Any, User]]:
+    """Dependency factory that verifies fine-grained RolePermission access.
+
+    ADMIN users bypass the table lookup and are always granted access.
+    """
+
+    async def _guard(
+        user: User = Depends(get_current_user),
+        session: AsyncSession = Depends(get_session),
+    ) -> User:
+        if user.role == Role.ADMIN.value:
+            return user
+        repo = RolePermissionRepository(session)
+        if not await repo.has_permission(user.role, permission):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Missing required permission: {permission.value}",
+            )
+        return user
+
+    return _guard
 
 
 # Aliases for cleaner signatures

@@ -1,4 +1,4 @@
-"""User self-service routes — profile and password."""
+"""User self-service routes — profile, QR details, and password."""
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +9,7 @@ from shackles.schemas.common import MessageResponse
 from shackles.schemas.user import (
     UserPasswordChange,
     UserRead,
+    UserReadWithQR,
     UserUpdate,
 )
 from shackles.services.auth_service import AuthService
@@ -18,10 +19,10 @@ from shackles.services.user_service import UserService
 router = APIRouter(prefix="/users", tags=["users"])
 
 
-@router.get("/me", response_model=UserRead)
-async def get_me(user: CurrentUser) -> UserRead:
-    """Return the authenticated user's profile."""
-    return UserRead.model_validate(user)
+@router.get("/me", response_model=UserReadWithQR)
+async def get_me(user: CurrentUser) -> UserReadWithQR:
+    """Return the authenticated user's profile including QR metadata."""
+    return UserReadWithQR.model_validate(user)
 
 
 @router.patch("/me", response_model=UserRead)

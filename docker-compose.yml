@@ -23,7 +23,7 @@ services:
       # Speeds up initdb; safe for local dev
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     ports:
-      - "5433:5432"
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -56,7 +56,7 @@ services:
   # ----------------------------------------------------------
   # pgAdmin 4 — Web UI for managing PostgreSQL
   # Access: http://localhost:5050
-  # Login:  admin@shackles.local / admin
+  # Login:  admin@example.com / admin
   # ----------------------------------------------------------
   pgadmin:
     image: dpage/pgadmin4:latest

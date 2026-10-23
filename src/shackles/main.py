@@ -1,23 +1,25 @@
 """FastAPI application entry point."""
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from slowapi.errors import RateLimitExceeded
 from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 
 from shackles.api.errors import register_exception_handlers
 from shackles.api.routes import (
+    accommodation as accommodation_routes,
     auth as auth_routes,
     contact as contact_routes,
     events as event_routes,
     health as health_routes,
+    papers as paper_routes,
     payments as payment_routes,
     registrations as registration_routes,
     scanner as scanner_routes,
@@ -116,6 +118,8 @@ def create_app() -> FastAPI:
     app.include_router(event_routes.router, prefix="/api")
     app.include_router(registration_routes.router, prefix="/api")
     app.include_router(team_routes.router, prefix="/api")
+    app.include_router(paper_routes.router, prefix="/api")
+    app.include_router(accommodation_routes.router, prefix="/api")
     app.include_router(contact_routes.router, prefix="/api")
     app.include_router(payment_routes.router, prefix="/api")
     app.include_router(scanner_routes.router, prefix="/api")
@@ -134,3 +138,15 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+
+def run() -> None:
+    """CLI entry point for `uv run shackles`."""
+    import uvicorn
+
+    uvicorn.run(
+        "shackles.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=settings.is_development,
+    )

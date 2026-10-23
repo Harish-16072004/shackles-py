@@ -1,14 +1,18 @@
-"""Payment proof upload route."""
+"""Participant payment routes — proof upload, payment submission, and status lookup."""
 
-import uuid
 from pathlib import Path
+import uuid
 
-from fastapi import APIRouter, Depends, File, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Request, Response, UploadFile
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from shackles.api.deps import CurrentUser
 from shackles.config import settings
+from shackles.db.session import get_session
 from shackles.errors import INVALID_INPUT, DomainError
+from shackles.schemas.payment import PaymentCreate, PaymentRead
+from shackles.services.payment_service import PaymentService
 from shackles.services.rate_limit import LIMIT_UPLOAD, limiter
 
 
@@ -43,6 +47,7 @@ def _infer_extension(upload: UploadFile) -> str:
 @limiter.limit(LIMIT_UPLOAD)
 async def upload_payment_proof(
     request: Request,
+    response: Response,
     user: CurrentUser,
     file: UploadFile = File(...),
 ) -> ProofUploadResponse:
@@ -79,3 +84,27 @@ async def upload_payment_proof(
         proof_path=storage_key,
         proof_url=signed_url,
     )
+
+
+@router.post("", response_model=PaymentRead, status_code=201)
+async def submit_payment(
+    payload: PaymentCreate,
+    user: CurrentUser,
+    session: AsyncSession = Depends(get_session),
+) -> PaymentRead:
+    """Submit a payment record for the authenticated user."""
+    service = PaymentService(session)
+    payment = await service.create_for_user(user.id, payload)
+    await session.commit()
+    return PaymentRead.model_validate(payment)
+
+
+@router.get("/me", response_model=PaymentRead)
+async def get_my_payment(
+    user: CurrentUser,
+    session: AsyncSession = Depends(get_session),
+) -> PaymentRead:
+    """Fetch the authenticated user's payment record and verification status."""
+    service = PaymentService(session)
+    payment = await service.get_by_user_id(user.id)
+    return PaymentRead.model_validate(payment)

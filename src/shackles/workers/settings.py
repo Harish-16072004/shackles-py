@@ -6,6 +6,7 @@
 import logging
 from typing import Any
 
+from arq import cron
 from arq.connections import RedisSettings
 
 from shackles.config import settings
@@ -62,7 +63,7 @@ class WorkerSettings:
     # How many jobs to run concurrently per worker
     max_jobs = 10
 
-    # Optional: cron jobs (uncomment to enable daily cleanup)
-    # cron_jobs = [
-    #     cron(cleanup_expired_invites_job, hour=3, minute=0),
-    # ]
+    # Daily cleanup of expired team invitations at 03:00 UTC
+    cron_jobs = [
+        cron(cleanup_expired_invites_job, hour=3, minute=0),
+    ]

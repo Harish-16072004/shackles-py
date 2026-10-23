@@ -1,17 +1,17 @@
-"""Admin payment verification routes.
+"""Admin payment verification and queue routes.
 
 On APPROVE, allocates a Shackles ID + QR token and enqueues a QR
 generation job. The job creates the QR image, saves it, updates the
 user record, and dispatches the payment-verified email.
 
-Also exposes a QR regeneration endpoint so admins can re-trigger
-generation if the initial job failed.
+Also exposes a list endpoint for the verification queue and a QR
+regeneration endpoint so admins can re-trigger generation if needed.
 """
 
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shackles.api.deps import CurrentAdmin
@@ -22,8 +22,11 @@ from shackles.errors import (
     NOT_FOUND,
     DomainError,
 )
+from shackles.models.enums import PaymentStatus
+from shackles.repositories.payment_repo import PaymentRepository
 from shackles.repositories.user_repo import UserRepository
 from shackles.schemas.payment import PaymentRead, PaymentVerify
+from shackles.services.notifications import notify_payment_verified
 from shackles.services.payment_service import PaymentService
 from shackles.workers.queue import enqueue_qr_generation
 
@@ -31,6 +34,44 @@ from shackles.workers.queue import enqueue_qr_generation
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/payments", tags=["admin-payments"])
+
+
+# ============================================================
+# List payments queue
+# ============================================================
+
+@router.get("", response_model=list[PaymentRead])
+async def list_payments(
+    admin: CurrentAdmin,
+    session: AsyncSession = Depends(get_session),
+    status: PaymentStatus | None = Query(default=None),
+    capture_source: str | None = Query(default=None),
+    year: int | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[PaymentRead]:
+    """List payment records filtered by status, capture source, or year."""
+    repo = PaymentRepository(session)
+    target_year = year or settings.active_year
+
+    if capture_source:
+        rows = await repo.list_by_capture_source(
+            capture_source.upper(),
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+    elif status is not None:
+        rows = await repo.list_by_status(
+            status,
+            year=target_year,
+            limit=limit,
+            offset=offset,
+        )
+    else:
+        rows = await repo.list(limit=limit, offset=offset)
+
+    return [PaymentRead.model_validate(p) for p in rows]
 
 
 # ============================================================
@@ -49,7 +90,9 @@ async def verify_payment(
     On APPROVE:
       1. Allocates a Shackles ID and QR token
       2. Commits the transaction
-      3. Enqueues a QR generation job (best-effort — never fails the request)
+      3. Enqueues a QR generation job (which sends the verification email
+         with the QR image URL; if Redis is unavailable, falls back to
+         enqueuing a plain verification notification).
     """
     service = PaymentService(session)
 
@@ -72,6 +115,14 @@ async def verify_payment(
                 user_id,
                 user_id,
             )
+            await notify_payment_verified(
+                user_email=qr_data["user_email"],
+                user_name=qr_data["user_name"],
+                shackles_id=qr_data["shackles_id"],
+                package_type=qr_data["package_type"],
+                year=qr_data["year"],
+                qr_image_url=None,
+            )
     else:
         payment = await service.reject(user_id, payload, admin_id=admin.id)
         await session.commit()
@@ -89,16 +140,7 @@ async def regenerate_qr(
     admin: CurrentAdmin,
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Re-enqueue a QR generation job for a verified user.
-
-    Useful when the original job failed (Redis was down, worker crashed,
-    template was missing) or the QR image file was deleted.
-
-    Preconditions:
-      - The user exists.
-      - The user's payment is VERIFIED.
-      - The user has both a `shackles_id` and a `qr_token`.
-    """
+    """Re-enqueue a QR generation job for a verified user."""
     user = await UserRepository(session).get(user_id)
     if user is None:
         raise DomainError(NOT_FOUND, "User not found.")

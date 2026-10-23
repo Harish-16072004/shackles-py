@@ -26,7 +26,6 @@ from shackles.models.user import User
 from shackles.repositories.payment_repo import PaymentRepository
 from shackles.repositories.user_repo import UserRepository
 from shackles.schemas.payment import PaymentCreate, PaymentVerify
-from shackles.services.notifications import notify_payment_verified
 from shackles.services.qr import generate_qr_token
 from shackles.services.shackles_id import allocate_shackles_id
 
@@ -107,7 +106,8 @@ class PaymentService:
 
         Returns:
             (updated_user, qr_payload_data) — the caller uses the second
-            value to enqueue a QR generation job after commit.
+            value to enqueue a QR generation job after commit (which also
+            dispatches the payment-verified email with the QR image URL).
 
         Raises:
             DomainError(NOT_FOUND) if the payment doesn't exist.
@@ -171,22 +171,15 @@ class PaymentService:
         await self.session.refresh(user)
         await self.session.refresh(payment)
 
-        # --- Notify (stub — will become ARQ job) ---
-        await notify_payment_verified(
-            user_email=user.email,
-            user_name=f"{user.first_name} {user.last_name}".strip(),
-            shackles_id=shackles_id,
-            package_type=payment.package_type or "EVENT_ONLY",
-            year=settings.active_year,
-            qr_image_url=None,
-        )
-
         # --- Return QR data for the caller to enqueue post-commit ---
         qr_payload_data = {
             "user_id": str(user.id),
+            "user_email": user.email,
+            "user_name": f"{user.first_name} {user.last_name}".strip(),
             "qr_token": qr_token,
             "shackles_id": shackles_id,
             "registration_type": user.registration_type,
+            "package_type": payment.package_type or "EVENT_ONLY",
             "year": settings.active_year,
         }
 
